@@ -14,7 +14,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <map>
 #include <sstream>
 
 #include <cstdio>
@@ -522,28 +521,36 @@ void apply_report_dates(GttConfig& cfg, bool today, bool this_week, bool this_mo
   cfg.set_json("to", std::string(to_buf));
 }
 
+/** Eine Zeile pro Subcommand — Usage-Zeile der Haupt-Hilfe und Validierung von `gtt help <cmd>`. */
+struct GttSubcommandHelp {
+  const char* name;
+  const char* usage_suffix;
+};
+
+constexpr GttSubcommandHelp k_gtt_subcommands[] = {
+    {"start", "[options] [project] [id]"},
+    {"stop", "[options]"},
+    {"cancel", "[options]"},
+    {"status", "[options]"},
+    {"sync", "[options]"},
+    {"list", "[options] [project]"},
+    {"report", "[options] [project] [ids...]"},
+    {"config", "[options]"},
+    {"log", "[options]"},
+    {"resume", "[options] [project]"},
+    {"edit", "[id]"},
+    {"create", "[options] [project] [title]"},
+    {"delete", "[id]"},
+};
+
 /// Commander-style usage suffix for the top-level `gtt` help (see Node `gtt --help`).
 std::string gtt_subcommand_usage_extra(const CLI::App* sub) {
-  static const std::map<std::string, const char*> kUsage{
-      {"start", "[options] [project] [id]"},
-      {"create", "[options] [project] [title]"},
-      {"status", "[options]"},
-      {"stop", "[options]"},
-      {"resume", "[options] [project]"},
-      {"cancel", "[options]"},
-      {"list", "[options] [project]"},
-      {"log", "[options]"},
-      {"sync", "[options]"},
-      {"edit", "[id]"},
-      {"delete", "[id]"},
-      {"report", "[options] [project] [ids...]"},
-      {"config", "[options]"},
-  };
-  const auto it = kUsage.find(sub->get_name());
-  if (it == kUsage.end()) {
-    return {};
+  for (const auto& e : k_gtt_subcommands) {
+    if (sub->get_name() == e.name) {
+      return std::string{" "} + e.usage_suffix;
+    }
   }
-  return std::string{" "} + it->second;
+  return {};
 }
 
 class GttFormatter : public CLI::Formatter {
@@ -558,6 +565,18 @@ class GttFormatter : public CLI::Formatter {
 };
 
 }  // namespace
+
+const std::vector<std::string>& gtt_cli_subcommand_names() {
+  static const std::vector<std::string> k = [] {
+    std::vector<std::string> out;
+    out.reserve(sizeof(k_gtt_subcommands) / sizeof(k_gtt_subcommands[0]));
+    for (const auto& e : k_gtt_subcommands) {
+      out.emplace_back(e.name);
+    }
+    return out;
+  }();
+  return k;
+}
 
 int run_gtt_cli(CLI::App& app, int argc, char** argv) {
   auto fmt = std::make_shared<GttFormatter>();
