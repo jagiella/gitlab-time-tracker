@@ -43,6 +43,7 @@ add_executable(gtt
   src/output.cpp
   src/cmd_log.cpp
   src/commands.cpp
+  src/tty_interactive.cpp
 )
 
 target_include_directories(gtt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -11,6 +12,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -21,6 +23,7 @@
 #ifdef _WIN32
 #include <io.h>
 #else
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -30,8 +33,77 @@
 #include "gitlab_client.hpp"
 #include "report.hpp"
 #include "tasks.hpp"
+#include "tty_interactive.hpp"
 
 namespace {
+
+using std::chrono::days;
+using std::chrono::duration_cast;
+using std::chrono::floor;
+using std::chrono::hh_mm_ss;
+using std::chrono::local_days;
+using std::chrono::local_seconds;
+using std::chrono::locate_zone;
+using std::chrono::seconds;
+using std::chrono::sys_seconds;
+using std::chrono::time_zone;
+using std::chrono::year_month_day;
+using std::chrono::zoned_time;
+
+std::string english_ordinal_day(unsigned d) {
+  if (d >= 11 && d <= 13) {
+    return std::to_string(d) + "th";
+  }
+  switch (d % 10) {
+    case 1:
+      return std::to_string(d) + "st";
+    case 2:
+      return std::to_string(d) + "nd";
+    case 3:
+      return std::to_string(d) + "rd";
+    default:
+      return std::to_string(d) + "th";
+  }
+}
+
+const char* english_month_full(unsigned m) {
+  static const char* k_names[] = {nullptr,     "January",  "February", "March",  "April",    "May",      "June",
+                                  "July",     "August",   "September", "October", "November", "December"};
+  if (m < 1 || m > 12) {
+    return "?";
+  }
+  return k_names[m];
+}
+
+/** Wie Node `moment`: "May 11th 2026 09:51" in der Anzeige-Zeitzone. */
+std::string format_moment_do_yyyy_hhmm(sys_seconds tp, const std::string& display_tz) {
+  if (tp == sys_seconds{}) {
+    return "?";
+  }
+  try {
+    const time_zone* z = locate_zone(display_tz);
+    const zoned_time zt{z, tp};
+    const local_seconds lt = zt.get_local_time();
+    const auto ld = floor<days>(lt);
+    const year_month_day ymd{local_days{ld}};
+    if (!ymd.ok()) {
+      return "?";
+    }
+    const auto y = static_cast<int>(ymd.year());
+    const unsigned mo = static_cast<unsigned>(ymd.month());
+    const unsigned day = static_cast<unsigned>(ymd.day());
+    const local_seconds midnight{local_days{ld}};
+    const hh_mm_ss<seconds> hms{duration_cast<seconds>(lt - midnight)};
+    const int H = static_cast<int>(hms.hours().count());
+    const int M = static_cast<int>(hms.minutes().count());
+    std::ostringstream os;
+    os << english_month_full(mo) << ' ' << english_ordinal_day(day) << ' ' << y << ' ' << std::setfill('0')
+       << std::setw(2) << H << ':' << std::setw(2) << M;
+    return os.str();
+  } catch (...) {
+    return "?";
+  }
+}
 
 bool tty_stdout() {
 #ifdef _WIN32
@@ -76,6 +148,96 @@ std::string resource_id_plain(const nlohmann::json& idj) {
   }
   return idj.dump();
 }
+
+std::string trim_ws(std::string s) {
+  auto not_space = [](unsigned char c) { return !std::isspace(c); };
+  while (!s.empty() && !not_space(static_cast<unsigned char>(s.front()))) {
+    s.erase(s.begin());
+  }
+  while (!s.empty() && !not_space(static_cast<unsigned char>(s.back()))) {
+    s.pop_back();
+  }
+  return s;
+}
+
+bool parse_uint_strict(const std::string& s, std::size_t& out) {
+  if (s.empty()) {
+    return false;
+  }
+  std::size_t pos = 0;
+  try {
+    const unsigned long v = std::stoul(s, &pos);
+    if (pos != s.size()) {
+      return false;
+    }
+    out = static_cast<std::size_t>(v);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifndef _WIN32
+std::string shell_single_quote_path(const std::filesystem::path& p) {
+  const std::string s = p.string();
+  std::string out = "'";
+  for (char c : s) {
+    if (c == '\'') {
+      out += "'\\''";
+    } else {
+      out += c;
+    }
+  }
+  out += '\'';
+  return out;
+}
+
+void launch_editor_path(const std::filesystem::path& path) {
+  const char* ed = std::getenv("VISUAL");
+  if (!ed || !*ed) {
+    ed = std::getenv("EDITOR");
+  }
+  if (ed && *ed) {
+    const std::string cmd = std::string(ed) + " " + shell_single_quote_path(path);
+    const pid_t pid = fork();
+    if (pid == 0) {
+      execlp("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
+      std::perror("execlp");
+      _exit(127);
+    }
+    if (pid < 0) {
+      std::perror("fork");
+      std::exit(1);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return;
+  }
+  const pid_t pid = fork();
+  if (pid == 0) {
+    execlp("xdg-open", "xdg-open", path.c_str(), static_cast<char*>(nullptr));
+    execlp("open", "open", path.c_str(), static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  if (pid > 0) {
+    waitpid(pid, nullptr, 0);
+  }
+}
+#else
+void launch_editor_path(const std::filesystem::path& path) {
+  const char* ed = std::getenv("VISUAL");
+  if (!ed || !*ed) {
+    ed = std::getenv("EDITOR");
+  }
+  const std::string p = path.string();
+  if (ed && *ed) {
+    const std::string cmd = std::string("\"") + ed + "\" \"" + p + "\"";
+    std::system(cmd.c_str());
+  } else {
+    std::system(("start \"\" \"" + p + "\"").c_str());
+  }
+}
+#endif
 
 /** Terminal display width (columns); requires UTF-8 locale for multibyte text. */
 int utf8_display_width(const std::string& s) {
@@ -153,6 +315,75 @@ std::string utf8_fit_visual_width(const std::string& s, std::size_t cols) {
     w += 1;
   }
   return t;
+}
+
+/**
+ * Eine Zeile für `gtt edit` — wie Node/Inquirer (`gtt-edit.js`): Moment-Datum, keine Nummer im TTY.
+ * @param fallback_index gesetzt → Zeilennummer wie bei Fallback-Eingabe (1–n)
+ * @param inquirer_selected_row true → Cyan auf Frame-ID, „ to “ und Titelspalte (@inquirer/select)
+ */
+std::string format_edit_menu_line(const Frame& fr, const std::string& tz, bool use_color,
+                                  std::optional<unsigned> fallback_index, bool inquirer_selected_row) {
+  const bool cyan_row = inquirer_selected_row && !fallback_index.has_value();
+  std::ostringstream row;
+  if (fallback_index.has_value()) {
+    row << std::setw(6) << std::right << *fallback_index << "  ";
+  }
+  if (use_color && cyan_row) {
+    row << "\033[36m";
+  }
+  row << fr.id << "  ";
+  if (use_color && cyan_row) {
+    row << "\033[0m";
+  }
+
+  const std::string start_human = format_moment_do_yyyy_hhmm(fr.start_sys(), tz);
+  if (use_color) {
+    row << "\033[32m";
+  }
+  row << start_human;
+  if (fr.stopped()) {
+    const std::string stop_hh = Frame::iso_hh_mm(*fr.stop_iso, fr.timezone, tz);
+    if (use_color && cyan_row) {
+      // „ to “ wie Frame-ID / Titel (Cyan); Endzeit bleibt Grün
+      row << "\033[0m\033[36m to \033[0m\033[32m" << stop_hh;
+    } else if (use_color) {
+      // „ to “ wie ID/Titel (Standardfarbe), nicht Grün
+      row << "\033[0m to \033[32m" << stop_hh;
+    } else {
+      row << " to " << stop_hh;
+    }
+  } else {
+    if (use_color) {
+      row << "\033[0m";
+    }
+    row << " (running)";
+  }
+  row << '\t';
+  if (use_color) {
+    row << "\033[35m";
+  }
+  row << utf8_fit_visual_width(fr.project, 50);
+  const std::string typ = fr.resource.at("type").get<std::string>();
+  const std::string rid = resource_id_plain(fr.resource.at("id"));
+  if (use_color) {
+    row << "\033[34m";
+  }
+  row << utf8_fit_visual_width(typ + " #" + rid, 20);
+  if (use_color) {
+    row << "\033[0m";
+  }
+  if (use_color && cyan_row) {
+    row << "\033[36m";
+  }
+  row << utf8_fit_visual_width(fr.title.value_or(""), 50);
+  if (use_color && cyan_row) {
+    row << "\033[0m";
+  }
+  if (fr.note.has_value() && !fr.note->empty()) {
+    row << *fr.note;
+  }
+  return row.str();
 }
 
 /** UTF-8 box-drawing repeat (U+2500). */
@@ -643,10 +874,111 @@ int run_gtt_cli(CLI::App& app, int argc, char** argv) {
     }
   });
 
-  auto* edit = app.add_subcommand("edit", "pick a running frame to edit note (stdin)");
+  auto* edit = app.add_subcommand("edit", "edit a frame JSON ($VISUAL / $EDITOR), optional id or pick from list");
+  std::optional<std::string> edit_id_arg;
+  edit->add_option("id", edit_id_arg)->description("frame id (optional .json); omit to choose interactively");
   edit->callback([&] {
-    std::cerr << "edit: use `gtt config` and edit frames manually, or use Node gtt edit.\n";
-    std::exit(1);
+    GttConfig& cfg = global_cfg();
+    cfg.reload_from_disk();
+    namespace fs = std::filesystem;
+    const fs::path frame_dir = cfg.frame_dir();
+    if (!fs::exists(frame_dir)) {
+      std::cerr << "No records found.\n";
+      std::exit(1);
+    }
+
+    fs::path target;
+    if (edit_id_arg.has_value() && !edit_id_arg->empty()) {
+      std::string id = trim_ws(*edit_id_arg);
+      if (id.size() > 5 && id.compare(id.size() - 5, 5, ".json") == 0) {
+        id.resize(id.size() - 5);
+      }
+      target = frame_dir / (id + ".json");
+      if (!fs::exists(target)) {
+        std::cerr << "No record found.\n";
+        std::exit(1);
+      }
+      launch_editor_path(target);
+      return;
+    }
+
+    constexpr std::size_t k_list_size = 30;
+    std::vector<std::pair<fs::file_time_type, fs::path>> files;
+    for (const auto& ent : fs::directory_iterator(frame_dir)) {
+      if (!ent.is_regular_file() || ent.path().extension() != ".json") {
+        continue;
+      }
+      files.emplace_back(fs::last_write_time(ent), ent.path());
+    }
+    std::sort(files.begin(), files.end());
+    const std::size_t start = files.size() > k_list_size ? files.size() - k_list_size : 0;
+    std::vector<Frame> frames;
+    frames.reserve(files.size() - start);
+    for (std::size_t i = start; i < files.size(); ++i) {
+      try {
+        frames.push_back(Frame::from_file(cfg, files[i].second));
+      } catch (...) {
+      }
+    }
+    std::sort(frames.begin(), frames.end(),
+              [](const Frame& a, const Frame& b) { return a.start_sys() < b.start_sys(); });
+    if (frames.empty()) {
+      std::cerr << "No records found.\n";
+      std::exit(1);
+    }
+
+    const std::string tz = cfg.timezone_name();
+    const bool use_color = tty_stdout();
+    std::vector<std::string> menu_lines;
+    menu_lines.reserve(frames.size());
+    std::vector<std::string> menu_selected;
+    menu_selected.reserve(frames.size());
+    for (const Frame& fr : frames) {
+      menu_lines.push_back(format_edit_menu_line(fr, tz, use_color, std::nullopt, false));
+      menu_selected.push_back(format_edit_menu_line(fr, tz, use_color, std::nullopt, true));
+    }
+
+    const gtt::ArrowSelectResult pick = gtt::tty_arrow_select(
+        menu_lines, menu_selected, frames.empty() ? 0 : frames.size() - 1, "Frame?");
+    if (pick.kind == gtt::ArrowSelectKind::Cancelled) {
+      std::cout << "Aborted.\n";
+      return;
+    }
+    if (pick.kind == gtt::ArrowSelectKind::Selected) {
+      target = frames[pick.index].file_path(cfg);
+      launch_editor_path(target);
+      return;
+    }
+
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+      std::cout << format_edit_menu_line(frames[i], tz, use_color, static_cast<unsigned>(i + 1), false)
+                << "\n";
+    }
+    std::cout << "Enter number (1-" << frames.size() << ") or frame id: " << std::flush;
+    std::string line;
+    if (!std::getline(std::cin, line)) {
+      std::exit(1);
+    }
+    line = trim_ws(line);
+    if (line.empty()) {
+      std::cout << "Aborted.\n";
+      return;
+    }
+    std::size_t n = 0;
+    if (parse_uint_strict(line, n) && n >= 1 && n <= frames.size()) {
+      target = frames[n - 1].file_path(cfg);
+    } else {
+      std::string id = line;
+      if (id.size() > 5 && id.compare(id.size() - 5, 5, ".json") == 0) {
+        id.resize(id.size() - 5);
+      }
+      target = frame_dir / (id + ".json");
+      if (!fs::exists(target)) {
+        std::cerr << "record not found.\n";
+        std::exit(1);
+      }
+    }
+    launch_editor_path(target);
   });
 
   auto* create =
